@@ -821,7 +821,7 @@ function clOptions() {
     if (!Number.isFinite(v)) throw new Error(`参数 ${k} 不是有效数字`);
   }
   if (opts.max_enclosure_distance <= 0 || opts.huber_delta <= 0) {
-    throw new Error("包围距离与 Huber 阈值必须为正数");
+    throw new Error("包围距离（沿线）与 Huber 阈值必须为正数");
   }
   return opts;
 }
@@ -990,13 +990,15 @@ function clInterpTable(xpt) {
       <td>${esc(lid)}</td>
       <td>${v.station_m}</td>
       <td>#${a.index}→#${b.index}</td>
-      <td>${a.projection_distance}/${b.projection_distance}</td>
+      <td>${a.station_distance}/${b.station_distance}</td>
+      <td>${v.along_track_distance_sum}</td>
+      <td>${v.enclosure_limit_m}</td>
       <td>${v.ratio_t}</td>
       <td>${v.interpolated_depth}</td>
     </tr>`;
   }).join("");
   return `<table class="cl-interp">
-    <tr><th>测线</th><th>交点里程</th><th>端点(原始索引)</th><th>两端投影距离</th><th>比例 t</th><th>插值水深</th></tr>
+    <tr><th>测线</th><th>交点里程</th><th>端点(原始索引)</th><th>两端沿线距离</th><th>沿线距离和</th><th>包围距离</th><th>比例 t</th><th>插值水深</th></tr>
     ${rows}
   </table>`;
 }

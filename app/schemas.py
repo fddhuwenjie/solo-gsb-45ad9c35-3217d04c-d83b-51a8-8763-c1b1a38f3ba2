@@ -86,8 +86,9 @@ class ClosureOptions(BaseModel):
     """交叉点水深闭合参数。"""
 
     max_enclosure_distance: float = Field(
-        default=15.0, gt=0,
-        description="包围距离：交点两侧相邻样本到计划测线的投影距离均不得超过该值",
+        default=100.0, gt=0,
+        description="包围距离（沿线）：包围交点的相邻样本，其投影里程到交点里程的绝对差"
+                    "（端点沿线距离）两端均不得超过该值；多组候选取两端沿线距离之和最小者",
     )
     huber_delta: float = Field(
         default=0.3, gt=0,

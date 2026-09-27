@@ -8,9 +8,10 @@
 2. 对每条参与交点的测线，按 **原始采集顺序** 在该线样本中寻找相邻样本对 (a, b)：
    - 两样本的投影里程跨过交点里程（``min(s_a,s_b) ≤ s_x ≤ max(s_a,s_b)``，允许
      采集方向与计划线 start→end 反向）；
-   - 两端样本到计划线所在直线的投影距离均 ≤ 包围距离 ``max_enclosure_distance``。
-   候选超过一组时取两端到交点直线距离之和最小者，再以 a 的原始索引破同值；
-   水深按里程线性插值 ``d = d_a + (d_b - d_a) * t``（t 为交点在 a→b 上的里程比例）。
+   - 两端样本的投影里程到交点里程的绝对差（端点沿线距离）均 ≤ 包围距离
+     ``max_enclosure_distance``，即 |s_a-s_x| ≤ D 且 |s_b-s_x| ≤ D。
+   - 候选超过一组时取两端沿线距离之和 |s_a-s_x|+|s_b-s_x| 最小者，再以 a、b 的
+     原始索引破同值；水深按里程线性插值 ``d = d_a + (d_b - d_a) * t``（t 为交点在 a→b 上的里程比例）。
 3. 用每个交点的水深差建立偏置方程：``b_li - b_lj = d_j - d_i``（字典序小者为左），
    交点残差 ``r = (d_i + b_i) - (d_j + b_j)``。按连通分量求解，每个分量固定
    **字典序最小测线偏置为零**（基准）；NumPy IRLS + Huber 权（阈值 ``huber_delta``）。
@@ -52,9 +53,10 @@ RULE_INTERSECTION = (
 RULE_ENCLOSURE = (
     "样本按原始采集顺序取同线相邻对 (a,b)：投影里程跨过交点 "
     "(min(s_a,s_b) ≤ s_x ≤ max(s_a,s_b)，允许采集方向反向) "
-    "且两端到计划线所在直线的投影距离均 ≤ max_enclosure_distance；"
-    "候选多组时取两端到交点直线距离之和最小者，再以 a 的原始索引破同值；"
-    "水深按里程线性插值 d = d_a + (d_b-d_a)·t，t=(s_x-s_a)/(s_b-s_a)"
+    "且两端投影里程与交点里程的绝对差（端点沿线距离）均 ≤ max_enclosure_distance，"
+    "即 |s_a-s_x| ≤ D 且 |s_b-s_x| ≤ D（横向投影距离不参与判限，仅作参考输出）；"
+    "候选多组时取两端沿线距离之和 |s_a-s_x|+|s_b-s_x| 最小者，再以 a、b 的原始索引"
+    "破同值；水深按里程线性插值 d = d_a + (d_b-d_a)·t，t=(s_x-s_a)/(s_b-s_a)"
 )
 RULE_ADJUSTMENT = (
     "偏置方程 b_li - b_lj = d_j - d_i（li < lj 字典序），交点残差 "
@@ -184,41 +186,53 @@ def check_closure(req: ClosureRequest) -> dict[str, Any]:
                 continue
             s_x = pl.project(ix, iy)[0]  # 交点在该线 start→end 上的里程（投影距离≈0）
             ps = proj[lid]
-            best: tuple[float, int, int] | None = None
+            best_k = -1
+            best_key: tuple[float, int, int] | None = None
             # 原始顺序扫描相邻样本对（样本不重排）
             for k in range(1, len(ss)):
                 i_a, i_b = ss[k - 1]["i"], ss[k]["i"]
-                s_a, d_a = ps[k - 1]
-                s_b, d_b = ps[k]
-                if min(s_a, s_b) <= s_x <= max(s_a, s_b) and d_a <= max_d and d_b <= max_d:
-                    da = math.hypot(ss[k - 1]["x"] - ix, ss[k - 1]["y"] - iy)
-                    db = math.hypot(ss[k]["x"] - ix, ss[k]["y"] - iy)
-                    key = (da + db, i_a, i_b)
-                    if best is None or key < best:
-                        best = (k, i_a, i_b)
-            if best is None:
+                s_a, _ = ps[k - 1]
+                s_b, _ = ps[k]
+                # 判限用端点投影里程到交点里程的绝对差（沿线距离），
+                # 两端均不超限才保留；横向投影距离不参与判限
+                ds_a, ds_b = abs(s_a - s_x), abs(s_b - s_x)
+                if min(s_a, s_b) <= s_x <= max(s_a, s_b) \
+                        and ds_a <= max_d and ds_b <= max_d:
+                    # 先按两端沿线距离之和、再按两端原始索引稳定取最优（反向采集同样适用）
+                    key = (ds_a + ds_b, i_a, i_b)
+                    if best_key is None or key < best_key:
+                        best_k, best_key = k, key
+            if best_key is None:
                 missing.append(lid)
                 continue
-            k, i_a, i_b = best[0], best[1], best[2]
+            k = best_k
+            span_sum, i_a, i_b = best_key
             s_a, d_a = ps[k - 1]
             s_b, d_b = ps[k]
             sa, sb = ss[k - 1], ss[k]
+            ds_a, ds_b = abs(s_a - s_x), abs(s_b - s_x)
             t = (s_x - s_a) / (s_b - s_a) if s_b != s_a else 0.0
             depth = sa["depth"] + (sb["depth"] - sa["depth"]) * t
             interp[lid] = {
                 "station_m": r4(s_x),
+                "enclosure_limit_m": r4(max_d),
+                "along_track_distance_sum": r4(span_sum),
                 "endpoints": [
                     {
                         "index": i_a,
                         "x": r6(sa["x"]), "y": r6(sa["y"]),
-                        "station_m": r4(s_a), "projection_distance": r4(d_a),
+                        "station_m": r4(s_a),
+                        "station_distance": r4(ds_a),
+                        "projection_distance": r4(d_a),
                         "distance_to_intersection": r4(math.hypot(sa["x"] - ix, sa["y"] - iy)),
                         "depth": r4(sa["depth"]),
                     },
                     {
                         "index": i_b,
                         "x": r6(sb["x"]), "y": r6(sb["y"]),
-                        "station_m": r4(s_b), "projection_distance": r4(d_b),
+                        "station_m": r4(s_b),
+                        "station_distance": r4(ds_b),
+                        "projection_distance": r4(d_b),
                         "distance_to_intersection": r4(math.hypot(sb["x"] - ix, sb["y"] - iy)),
                         "depth": r4(sb["depth"]),
                     },
@@ -238,8 +252,8 @@ def check_closure(req: ClosureRequest) -> dict[str, Any]:
                 else:
                     reason = (f"交点 {xpt_id}（{la} × {lb} @ [{r6(ix)}, {r6(iy)}]）处"
                               f"测线 {lid} 缺少有效包围样本：没有投影里程跨过交点"
-                              f"（里程 {r4(lines[lid].project(ix, iy)[0])}）且两端投影距离"
-                              f"均 ≤ {max_d} 的同线相邻样本对")
+                              f"（里程 {r4(lines[lid].project(ix, iy)[0])}）且两端投影里程"
+                              f"到交点里程的绝对差（沿线距离）均 ≤ {max_d} 的同线相邻样本对")
                 skips.append({
                     "kind": kind,
                     "kind_label": SKIP_LABELS[kind],
@@ -464,8 +478,9 @@ def check_closure(req: ClosureRequest) -> dict[str, Any]:
             "enclosure_rule": RULE_ENCLOSURE,
             "adjustment_rule": RULE_ADJUSTMENT,
             "projection_note": "投影里程沿计划线 start→end（可越出 [0,length]）；"
-                               "投影距离为样本到计划线所在无限直线的垂直距离；"
-                               "跨线候选要求两端投影距离均 ≤ max_enclosure_distance",
+                               "投影距离为样本到计划线所在无限直线的横向垂直距离（仅参考，"
+                               "不参与判限）；跨线候选要求两端投影里程到交点里程的绝对差"
+                               "（端点沿线距离）均 ≤ max_enclosure_distance",
             "skip_reasons": SKIP_LABELS,
             "status_labels": STATUS_LABELS,
             "coordinate_note": "输入视为平面坐标，水深与坐标长度单位一致即可",
