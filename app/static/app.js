@@ -990,13 +990,13 @@ function clInterpTable(xpt) {
       <td>${esc(lid)}</td>
       <td>${v.station_m}</td>
       <td>#${a.index}→#${b.index}</td>
-      <td>${a.projection_distance}/${b.projection_distance}</td>
+      <td>${a.alongtrack_distance_m}/${b.alongtrack_distance_m}</td>
       <td>${v.ratio_t}</td>
       <td>${v.interpolated_depth}</td>
     </tr>`;
   }).join("");
   return `<table class="cl-interp">
-    <tr><th>测线</th><th>交点里程</th><th>端点(原始索引)</th><th>两端投影距离</th><th>比例 t</th><th>插值水深</th></tr>
+    <tr><th>测线</th><th>交点里程</th><th>端点(原始索引)</th><th>两端沿线距离</th><th>比例 t</th><th>插值水深</th></tr>
     ${rows}
   </table>`;
 }
@@ -1043,6 +1043,7 @@ function renderClXptCard(xpt) {
       <details>
         <summary>插值端点 / 比例 / 偏置依据</summary>
         <div class="basis">
+          <div class="method">${esc(clResult.meta.enclosure_rule)}</div>
           ${clInterpTable(xpt)}
           <div class="method">${esc(clResult.meta.adjustment_rule)}</div>
         </div>

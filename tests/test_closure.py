@@ -18,7 +18,8 @@ def _run(payload):
 
 def _sample_payload(samples, lines=None, options=None):
     return {"lines": lines or [H, V], "samples": samples,
-            "options": options or {}}
+            "options": options or {"max_enclosure_distance": 50,
+                                   "huber_delta": 0.3, "residual_threshold": 0.5}}
 
 
 def _s(lid, x, y, d):
@@ -49,7 +50,7 @@ def test_sample_skips_cover_three_reasons():
     })
     kinds = [sk["kind"] for sk in res["skips"]]
     assert kinds.count("overlapping") == 1          # H2/H2D 共线重叠
-    assert kinds.count("no_bracketing_samples") == 1  # H3×V3 横向偏离超限
+    assert kinds.count("no_bracketing_samples") == 1  # H3×V3 包围对沿线超距
     assert kinds.count("unknown_line") == 4          # LX + H2D 三个点交点
     ovl = next(sk for sk in res["skips"] if sk["kind"] == "overlapping")
     assert ovl["lines"] == ["H2", "H2D"]
@@ -94,7 +95,13 @@ def test_interpolation_endpoints_and_ratio():
     assert h1["ratio_t"] == 0.5
     assert v1["ratio_t"] == 0.2
     assert [e["index"] for e in h1["endpoints"]] == [1, 2]
-    assert [e["index"] for e in v1["endpoints"]] == [34, 35]  # H1/H2/H3 各 11 个后 V1 起 33
+    # H1/H2 各 11 个、H3 缺两个样本为 9 个后，V1 起点索引 31
+    assert [e["index"] for e in v1["endpoints"]] == [32, 33]
+    # 沿线距离（里程绝对差）参与判限；横向投影距离仅作参考保留
+    assert [e["alongtrack_distance_m"] for e in h1["endpoints"]] == [50.0, 50.0]
+    assert [e["projection_distance"] for e in v1["endpoints"]] == [3.0, 3.0]
+    assert h1["max_enclosure_distance"] == 100.0
+    assert h1["bracketing_pair_count"] == 1 and h1["eligible_pair_count"] == 1
 
 
 # ----------------------------- 交点与重叠 -----------------------------
@@ -136,10 +143,15 @@ def test_overlapping_collinear_lines_skipped():
 
 def test_parallel_disjoint_lines_not_reported():
     h2 = {"id": "H2", "start": [0, 80], "end": [100, 80], "swath": 10}  # 平行不相交
-    samples = [_s("H", 0, 50, 10), _s("H", 100, 50, 10),
-               _s("H2", 0, 80, 10), _s("H2", 100, 80, 10),
-               _s("V", 50, 0, 10), _s("V", 50, 100, 10)]
-    res = _run(_sample_payload(samples, lines=[H, h2, V]))
+    samples = [_s("H", 40, 50, 10), _s("H", 60, 50, 10),
+               _s("H2", 40, 80, 10), _s("H2", 60, 80, 10),
+               _s("V", 50, 45, 10), _s("V", 50, 55, 10),
+               _s("V", 50, 75, 10), _s("V", 50, 85, 10)]
+    # V 沿里程 45,55,75,85 采集：相邻对 (45,55) 包围 H×V（y=50）、(75,85) 包围
+    # H2×V（y=80），两端沿线距离均为 5 ≤ 15；中间 (55,75) 不包围任何交点
+    res = _run(_sample_payload(samples, lines=[H, h2, V],
+                               options={"max_enclosure_distance": 15,
+                                        "huber_delta": 0.3, "residual_threshold": 0.5}))
     assert res["skips"] == []
     assert res["summary"]["point_intersection_count"] == 2  # H×V 与 H2×V
 
@@ -159,33 +171,104 @@ def test_missing_enclosing_pair_skip():
     assert res["summary"]["skip_counts"]["no_bracketing_samples"] == 1
 
 
-def test_projection_distance_limit_filters_pair():
-    # H 的 40/60 样本横向偏离 40，超出包围距离 15，不能包围交点
+def test_alongtrack_distance_limit_filters_pair():
+    # H 样本就在计划线上（横向偏离 0），但 0/100 包围对两端沿线距离均为 50：
+    # 包围距离 15 时端点“贴近测线但沿线离交点过远”，必须拒绝（旧实现误用横向
+    # 投影距离判限，会把这种超距端点接纳进来）
     samples = [
-        _s("H", 0, 50, 10.0), _s("H", 40, 90, 10.0),
-        _s("H", 60, 90, 10.0), _s("H", 100, 50, 10.0),
+        _s("H", 0, 50, 10.0), _s("H", 100, 50, 10.0),
         _s("V", 50, 0, 10.0), _s("V", 50, 100, 10.0),
     ]
     res = _run(_sample_payload(samples, options={"max_enclosure_distance": 15,
                                                  "huber_delta": 0.3, "residual_threshold": 0.5}))
     assert res["intersections"] == []
     assert res["skips"][0]["kind"] == "no_bracketing_samples"
-    # 放宽包围距离后即可包围（投影距离 40）
-    res2 = _run(_sample_payload(samples, options={"max_enclosure_distance": 45,
+    assert res["skips"][0]["line"] == "H"
+    # 放宽包围距离到 50 后两端均不超限，可正常包围插值
+    res2 = _run(_sample_payload(samples, options={"max_enclosure_distance": 50,
                                                   "huber_delta": 0.3, "residual_threshold": 0.5}))
     assert res2["summary"]["intersection_count"] == 1
+    h = res2["intersections"][0]["interpolations"]["H"]
+    assert [e["alongtrack_distance_m"] for e in h["endpoints"]] == [50.0, 50.0]
 
 
-def test_candidate_pair_min_distance_sum_then_original_index():
-    # 两组候选均跨过里程 50：(0,100) 与 (49,51)；后者两端到交点距离之和更小
+def test_one_endpoint_alongtrack_over_range_rejects_pair():
+    # 只有一个端点沿线超距（50 > 15）也必须拒绝；另一端沿线距离仅 10
     samples = [
-        _s("H", 0, 50, 10.0), _s("H", 49, 50, 10.0), _s("H", 51, 50, 10.0),
-        _s("H", 100, 50, 10.0),
+        _s("H", 0, 50, 10.0), _s("H", 60, 50, 10.0),
+        _s("V", 50, 0, 10.0), _s("V", 50, 100, 10.0),
+    ]
+    res = _run(_sample_payload(samples, options={"max_enclosure_distance": 15,
+                                                 "huber_delta": 0.3, "residual_threshold": 0.5}))
+    assert res["intersections"] == []
+    assert res["skips"][0]["kind"] == "no_bracketing_samples"
+    res2 = _run(_sample_payload(samples, options={"max_enclosure_distance": 50,
+                                                  "huber_delta": 0.3, "residual_threshold": 0.5}))
+    h = res2["intersections"][0]["interpolations"]["H"]
+    assert [e["alongtrack_distance_m"] for e in h["endpoints"]] == [50.0, 10.0]
+
+
+def test_lateral_offset_alone_does_not_filter_pair():
+    # H 的 40/60 样本横向偏离 40，但沿线距离只有 10/10：横向投影距离不参与判限，
+    # 包围距离 15 时仍应接纳（旧实现会因横向偏离 40 错误跳过该交点）
+    samples = [
+        _s("H", 0, 50, 10.0), _s("H", 40, 90, 10.0),
+        _s("H", 60, 90, 10.0), _s("H", 100, 50, 10.0),
+        _s("V", 50, 45, 10.0), _s("V", 50, 55, 10.0),
+    ]
+    res = _run(_sample_payload(samples, options={"max_enclosure_distance": 15,
+                                                 "huber_delta": 0.3, "residual_threshold": 0.5}))
+    assert res["summary"]["intersection_count"] == 1
+    h = res["intersections"][0]["interpolations"]["H"]
+    assert [e["index"] for e in h["endpoints"]] == [1, 2]
+    assert [e["alongtrack_distance_m"] for e in h["endpoints"]] == [10.0, 10.0]
+    # 横向投影距离仍作为参考字段输出，但不作为判限
+    assert [e["projection_distance"] for e in h["endpoints"]] == [40.0, 40.0]
+    assert h["bracketing_pair_count"] == 1 and h["eligible_pair_count"] == 1
+
+
+def test_multiple_candidates_select_by_alongtrack_sum():
+    # 同一测线存在三组相邻跨点样本（采集里程来回摆动）：
+    # 原序 (0,60) / (60,40) / (40,100)，交点里程 50。中间一组两端横向偏离 30，
+    # 旧实现按到交点直线距离排序会选 (0,60)（且按横向距离判限时行为被污染）；
+    # 新实现按沿线距离和：60 / 20 / 60，应选 (60,40)，且 max_d=25 时只有它两端不超限
+    samples = [
+        _s("H", 0, 50, 100.0), _s("H", 60, 80, 60.0),
+        _s("H", 40, 80, 40.0), _s("H", 100, 50, 100.0),
+        _s("V", 50, 45, 10.0), _s("V", 50, 55, 10.0),
+    ]
+    res = _run(_sample_payload(samples, options={"max_enclosure_distance": 25,
+                                                 "huber_delta": 0.3, "residual_threshold": 0.5}))
+    xpt = res["intersections"][0]
+    h = xpt["interpolations"]["H"]
+    assert [e["index"] for e in h["endpoints"]] == [1, 2]
+    assert [e["alongtrack_distance_m"] for e in h["endpoints"]] == [10.0, 10.0]
+    assert h["bracketing_pair_count"] == 3 and h["eligible_pair_count"] == 1
+    assert h["max_enclosure_distance"] == 25.0
+    # t=(50-60)/(40-60)=0.5，插值水深 50（旧实现错选 (0,60) 会得到 66.67）
+    assert h["ratio_t"] == 0.5
+    assert h["interpolated_depth"] == 50.0
+    # 插值依据输出字段完整
+    assert {"station_m", "alongtrack_distance_m", "projection_distance",
+            "distance_to_intersection", "depth"} <= set(h["endpoints"][0])
+
+
+def test_tied_alongtrack_sum_broken_by_original_index():
+    # 两组候选沿线距离和完全相同（里程 40→60 与 60→40，均为 20）：
+    # 按 a（再 b）的原始索引稳定取最前者，不依赖扫描外的任何偶然状态
+    samples = [
+        _s("H", 40, 50, 40.0), _s("H", 60, 50, 60.0),
+        _s("H", 60, 50, 60.0), _s("H", 40, 50, 40.0),
         _s("V", 50, 0, 10.0), _s("V", 50, 100, 10.0),
     ]
     res = _run(_sample_payload(samples))
-    xpt = res["intersections"][0]
-    assert [e["index"] for e in xpt["interpolations"]["H"]["endpoints"]] == [1, 2]
+    h = res["intersections"][0]["interpolations"]["H"]
+    assert [e["index"] for e in h["endpoints"]] == [0, 1]
+    assert h["bracketing_pair_count"] == 2 and h["eligible_pair_count"] == 2
+    # 再次运行结果一致（稳定破选）
+    res2 = _run(_sample_payload(samples))
+    h2 = res2["intersections"][0]["interpolations"]["H"]
+    assert [e["index"] for e in h2["endpoints"]] == [0, 1]
 
 
 def test_reverse_acquisition_direction_supported():
@@ -200,6 +283,12 @@ def test_reverse_acquisition_direction_supported():
     # t 始终按 (s_x-s_a)/(s_b-s_a) 计算，a 为原序在前的样本（里程 100）
     assert h["ratio_t"] == 0.5
     assert h["interpolated_depth"] == 11.0
+    assert [e["alongtrack_distance_m"] for e in h["endpoints"]] == [50.0, 50.0]
+    # 反向采集同样受沿线距离判限：包围距离 15 时超距拒绝
+    res2 = _run(_sample_payload(samples, options={"max_enclosure_distance": 15,
+                                                  "huber_delta": 0.3, "residual_threshold": 0.5}))
+    assert res2["intersections"] == []
+    assert res2["skips"][0]["kind"] == "no_bracketing_samples"
 
 
 def test_linear_depth_interpolation_value():
@@ -272,7 +361,7 @@ def test_square_network_redundant_component_and_biases():
     for y in (0, 50, 100):
         samples.append(_s("V2", 100, y, 20.0 + offset["V2"]))
     res = _run(_sample_payload(samples, lines=_grid_lines(),
-                               options={"max_enclosure_distance": 5, "huber_delta": 0.3,
+                               options={"max_enclosure_distance": 50, "huber_delta": 0.3,
                                         "residual_threshold": 0.5}))
     assert res["summary"]["intersection_count"] == 4
     comp = res["components"][0]
@@ -312,7 +401,7 @@ def test_anomaly_threshold_respected():
     for y in (0, 50, 100):
         samples.append(_s("V3", 100, y, 20.0))
     res = _run(_sample_payload(samples, lines=_ladder_lines(),
-                               options={"max_enclosure_distance": 5, "huber_delta": 0.3,
+                               options={"max_enclosure_distance": 50, "huber_delta": 0.3,
                                         "residual_threshold": 0.5}))
     bad = [x for x in res["intersections"] if x["status"] == "anomaly"]
     assert {tuple(x["lines"]) for x in bad} == {("H1", "V2"), ("H2", "V2")}
@@ -321,7 +410,7 @@ def test_anomaly_threshold_respected():
     assert len(clean) == 4 and all(x["final_weight"] == 1.0 for x in clean)
     # 放宽残差阈值后不再判异常
     res2 = _run(_sample_payload(samples, lines=_ladder_lines(),
-                                options={"max_enclosure_distance": 5, "huber_delta": 0.3,
+                                options={"max_enclosure_distance": 50, "huber_delta": 0.3,
                                          "residual_threshold": 5.0}))
     assert all(x["status"] == "ok" for x in res2["intersections"])
 

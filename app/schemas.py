@@ -87,7 +87,8 @@ class ClosureOptions(BaseModel):
 
     max_enclosure_distance: float = Field(
         default=15.0, gt=0,
-        description="包围距离：交点两侧相邻样本到计划测线的投影距离均不得超过该值",
+        description="包围距离：包围交点的相邻样本对两端投影里程到交点里程的绝对差"
+                    "（沿计划线里程）均不得超过该值；横向投影距离不参与判限",
     )
     huber_delta: float = Field(
         default=0.3, gt=0,

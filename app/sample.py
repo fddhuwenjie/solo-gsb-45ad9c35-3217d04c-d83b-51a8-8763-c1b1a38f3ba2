@@ -86,8 +86,8 @@ CONTINUITY_SAMPLE = {
 #
 # 故意覆盖三种跳过：
 # - H2D 与 H2 共线重叠 -> overlapping；H2D 自身不放任何样本
-# - H3 在 V3 交点（里程 870）两侧的样本横向偏离 40 m（>包围距离 15）
-#   -> no_bracketing_samples，该交点跳过
+# - H3 在 V3 交点（里程 870）两侧的 800/900 里程样本缺失：最近的包围对是
+#   (700, 1000)，两端沿线距离 170/130 均超包围距离 100 -> no_bracketing_samples
 # - 两个 LX 样本属于任务输入未定义的测线 -> unknown_line
 #
 # 水深沿计划线里程位置取值（横向偏移不引入水深场误差），干净交点的闭合差只剩
@@ -128,10 +128,11 @@ def _build_closure_samples() -> list[dict]:
     def add_line(line_id: str, horizontal: bool, fixed: float) -> None:
         for k in range(11):  # 里程 0,100,…,1000
             s = k * 100
-            off = 3.0 if k % 2 == 0 else -3.0
-            # H3 在 V3 交点（里程 870）两侧样本故意偏离 40 m，超出包围距离
+            # H3 在 V3 交点（里程 870）两侧的 800/900 里程样本故意缺失：
+            # 最近的包围对 (700, 1000) 两端沿线距离 170/130 均超包围距离
             if line_id == "H3" and k in (8, 9):
-                off = 40.0
+                continue
+            off = 3.0 if k % 2 == 0 else -3.0
             blip = 0.0
             # V2 里程 400/500 粗差 +5.0，仅污染 V2×H2（里程 480）一个交点
             if line_id == "V2" and k in (4, 5):
@@ -162,7 +163,7 @@ CLOSURE_SAMPLE = {
     "lines": _CLOSURE_LINES,
     "samples": _build_closure_samples(),
     "options": {
-        "max_enclosure_distance": 15.0,
+        "max_enclosure_distance": 100.0,
         "huber_delta": 0.3,
         "residual_threshold": 0.5,
     },

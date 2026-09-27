@@ -8,9 +8,12 @@
 2. 对每条参与交点的测线，按 **原始采集顺序** 在该线样本中寻找相邻样本对 (a, b)：
    - 两样本的投影里程跨过交点里程（``min(s_a,s_b) ≤ s_x ≤ max(s_a,s_b)``，允许
      采集方向与计划线 start→end 反向）；
-   - 两端样本到计划线所在直线的投影距离均 ≤ 包围距离 ``max_enclosure_distance``。
-   候选超过一组时取两端到交点直线距离之和最小者，再以 a 的原始索引破同值；
-   水深按里程线性插值 ``d = d_a + (d_b - d_a) * t``（t 为交点在 a→b 上的里程比例）。
+   - 两端样本的投影里程到交点里程的绝对差（沿计划线里程）均 ≤ 包围距离
+     ``max_enclosure_distance``——端点可能横向贴近测线但沿线离交点很远，
+     横向投影距离不作为判限。
+   候选超过一组时取两端沿线距离 |s−sₓ| 之和最小者，再以 a（再 b）的原始索引破同值；
+   水深按里程线性插值 ``d = d_a + (d_b - d_a) * t``
+   （t 为交点在 a→b 上的里程比例），采集方向反向时同样适用。
 3. 用每个交点的水深差建立偏置方程：``b_li - b_lj = d_j - d_i``（字典序小者为左），
    交点残差 ``r = (d_i + b_i) - (d_j + b_j)``。按连通分量求解，每个分量固定
    **字典序最小测线偏置为零**（基准）；NumPy IRLS + Huber 权（阈值 ``huber_delta``）。
@@ -51,9 +54,10 @@ RULE_INTERSECTION = (
 )
 RULE_ENCLOSURE = (
     "样本按原始采集顺序取同线相邻对 (a,b)：投影里程跨过交点 "
-    "(min(s_a,s_b) ≤ s_x ≤ max(s_a,s_b)，允许采集方向反向) "
-    "且两端到计划线所在直线的投影距离均 ≤ max_enclosure_distance；"
-    "候选多组时取两端到交点直线距离之和最小者，再以 a 的原始索引破同值；"
+    "(min(s_a,s_b) ≤ s_x ≤ max(s_a,s_b)，允许采集方向反向)，"
+    "且两端投影里程到交点里程的绝对差（沿线距离 |s-s_x|）均 ≤ max_enclosure_distance"
+    "（端点贴近测线但沿线离交点过远同样超距拒绝；横向投影距离不参与判限）；"
+    "候选多组时取两端沿线距离之和最小者，再以 a（再 b）的原始索引破同值；"
     "水深按里程线性插值 d = d_a + (d_b-d_a)·t，t=(s_x-s_a)/(s_b-s_a)"
 )
 RULE_ADJUSTMENT = (
@@ -171,11 +175,12 @@ def check_closure(req: ClosureRequest) -> dict[str, Any]:
     # ---- 2. 逐交点、逐线找有效包围样本并按里程线性插值水深 ----
     intersections: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []  # 偏置方程（有效交点），边交点按 XPT 序
-    for n, (la, lb, ix, iy) in enumerate(point_pairs, 1):
+    for n, (lid_a, lid_b, ix, iy) in enumerate(point_pairs, 1):
         xpt_id = f"XPT-{n:03d}"
         missing: list[str] = []
         interp: dict[str, dict[str, Any]] = {}
-        for lid in (la, lb):
+        bracket_counts: dict[str, tuple[int, int]] = {}
+        for lid in (lid_a, lid_b):
             pl = lines[lid]
             ss = by_line[lid]
             if not ss:
@@ -184,41 +189,55 @@ def check_closure(req: ClosureRequest) -> dict[str, Any]:
                 continue
             s_x = pl.project(ix, iy)[0]  # 交点在该线 start→end 上的里程（投影距离≈0）
             ps = proj[lid]
-            best: tuple[float, int, int] | None = None
-            # 原始顺序扫描相邻样本对（样本不重排）
+            best: tuple[float, int, int, int] | None = None
+            n_bracket = 0  # 投影里程跨过交点的相邻对数（不论是否超距）
+            n_eligible = 0  # 其中两端沿线距离均 ≤ 包围距离的候选数
+            # 原始顺序扫描相邻样本对（样本不重排）；判限用端点投影里程与交点里程
+            # 的绝对差（沿线距离），候选排序键 =（两端沿线距离和, a 原始索引, b 原始索引）
             for k in range(1, len(ss)):
                 i_a, i_b = ss[k - 1]["i"], ss[k]["i"]
-                s_a, d_a = ps[k - 1]
-                s_b, d_b = ps[k]
-                if min(s_a, s_b) <= s_x <= max(s_a, s_b) and d_a <= max_d and d_b <= max_d:
-                    da = math.hypot(ss[k - 1]["x"] - ix, ss[k - 1]["y"] - iy)
-                    db = math.hypot(ss[k]["x"] - ix, ss[k]["y"] - iy)
-                    key = (da + db, i_a, i_b)
-                    if best is None or key < best:
-                        best = (k, i_a, i_b)
+                s_a, _d_a = ps[k - 1]
+                s_b, _d_b = ps[k]
+                d_along_a, d_along_b = abs(s_a - s_x), abs(s_b - s_x)
+                if min(s_a, s_b) <= s_x <= max(s_a, s_b):
+                    n_bracket += 1
+                    if d_along_a <= max_d and d_along_b <= max_d:
+                        n_eligible += 1
+                        key = (d_along_a + d_along_b, i_a, i_b)
+                        if best is None or key < best[:3]:
+                            best = (key[0], i_a, i_b, k)
             if best is None:
                 missing.append(lid)
                 continue
-            k, i_a, i_b = best[0], best[1], best[2]
+            bracket_counts[lid] = (n_bracket, n_eligible)
+            _sum_d, i_a, i_b, k = best
             s_a, d_a = ps[k - 1]
             s_b, d_b = ps[k]
+            along_a, along_b = abs(s_a - s_x), abs(s_b - s_x)
             sa, sb = ss[k - 1], ss[k]
             t = (s_x - s_a) / (s_b - s_a) if s_b != s_a else 0.0
             depth = sa["depth"] + (sb["depth"] - sa["depth"]) * t
             interp[lid] = {
                 "station_m": r4(s_x),
+                "max_enclosure_distance": max_d,
+                "bracketing_pair_count": bracket_counts[lid][0],
+                "eligible_pair_count": bracket_counts[lid][1],
                 "endpoints": [
                     {
                         "index": i_a,
                         "x": r6(sa["x"]), "y": r6(sa["y"]),
-                        "station_m": r4(s_a), "projection_distance": r4(d_a),
+                        "station_m": r4(s_a),
+                        "alongtrack_distance_m": r4(along_a),
+                        "projection_distance": r4(d_a),
                         "distance_to_intersection": r4(math.hypot(sa["x"] - ix, sa["y"] - iy)),
                         "depth": r4(sa["depth"]),
                     },
                     {
                         "index": i_b,
                         "x": r6(sb["x"]), "y": r6(sb["y"]),
-                        "station_m": r4(s_b), "projection_distance": r4(d_b),
+                        "station_m": r4(s_b),
+                        "alongtrack_distance_m": r4(along_b),
+                        "projection_distance": r4(d_b),
                         "distance_to_intersection": r4(math.hypot(sb["x"] - ix, sb["y"] - iy)),
                         "depth": r4(sb["depth"]),
                     },
@@ -233,17 +252,18 @@ def check_closure(req: ClosureRequest) -> dict[str, Any]:
             for lid in missing:
                 kind = "unknown_line" if not by_line[lid] else "no_bracketing_samples"
                 if kind == "unknown_line":
-                    reason = (f"交点 {xpt_id}（{la} × {lb} @ [{r6(ix)}, {r6(iy)}]）处"
+                    reason = (f"交点 {xpt_id}（{lid_a} × {lid_b} @ [{r6(ix)}, {r6(iy)}]）处"
                               f"测线 {lid} 没有任何采集样本（未知测线/未采集），无法插值水深")
                 else:
-                    reason = (f"交点 {xpt_id}（{la} × {lb} @ [{r6(ix)}, {r6(iy)}]）处"
+                    reason = (f"交点 {xpt_id}（{lid_a} × {lid_b} @ [{r6(ix)}, {r6(iy)}]）处"
                               f"测线 {lid} 缺少有效包围样本：没有投影里程跨过交点"
-                              f"（里程 {r4(lines[lid].project(ix, iy)[0])}）且两端投影距离"
-                              f"均 ≤ {max_d} 的同线相邻样本对")
+                              f"（里程 {r4(lines[lid].project(ix, iy)[0])}）且两端投影里程"
+                              f"到交点里程的绝对差（沿线距离）均 ≤ {max_d} 的同线相邻样本对"
+                              f"（端点可能横向贴近测线，但沿线离交点过远同样超距拒绝）")
                 skips.append({
                     "kind": kind,
                     "kind_label": SKIP_LABELS[kind],
-                    "lines": sorted([la, lb]),
+                    "lines": sorted([lid_a, lid_b]),
                     "intersection_id": xpt_id,
                     "line": lid,
                     "point": [r6(ix), r6(iy)],
@@ -251,7 +271,7 @@ def check_closure(req: ClosureRequest) -> dict[str, Any]:
                 })
             continue
 
-        li, lj = sorted([la, lb])
+        li, lj = sorted([lid_a, lid_b])
         di = interp[li]["_depth_raw"]
         dj = interp[lj]["_depth_raw"]
         raw_misclosure = di - dj  # 原始闭合差 = 校正前水深差
@@ -261,7 +281,7 @@ def check_closure(req: ClosureRequest) -> dict[str, Any]:
         })
         intersections.append({
             "id": xpt_id,
-            "lines": sorted([la, lb]),
+            "lines": sorted([lid_a, lid_b]),
             "point": [r6(ix), r6(iy)],
             "interpolations": interp,
             "raw_misclosure": r4(raw_misclosure),
@@ -464,8 +484,9 @@ def check_closure(req: ClosureRequest) -> dict[str, Any]:
             "enclosure_rule": RULE_ENCLOSURE,
             "adjustment_rule": RULE_ADJUSTMENT,
             "projection_note": "投影里程沿计划线 start→end（可越出 [0,length]）；"
-                               "投影距离为样本到计划线所在无限直线的垂直距离；"
-                               "跨线候选要求两端投影距离均 ≤ max_enclosure_distance",
+                               "投影距离为样本到计划线所在无限直线的垂直距离，仅作横向质量参考、不参与判限；"
+                               "包围判限为端点投影里程到交点里程的绝对差（沿线距离），"
+                               "两端均 ≤ max_enclosure_distance 的相邻对才是有效候选",
             "skip_reasons": SKIP_LABELS,
             "status_labels": STATUS_LABELS,
             "coordinate_note": "输入视为平面坐标，水深与坐标长度单位一致即可",
